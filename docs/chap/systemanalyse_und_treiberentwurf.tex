@@ -1,0 +1,356 @@
+\chapter{Systemanalyse und Treiberentwurf}
+
+\section{Analyse der Systemanforderungen}
+Die Integration eines leistungsfähigen Grafiktreibers in den hhuOS-Mikrokernel
+bringt im Vergleich zu monolithischen Umgebungen wie Linux eine Reihe
+besonderer Herausforderungen mit sich. In hhuOS besitzt der Treiber keinen
+inhärenten privilegierten Zugriff auf den Systemspeicher; stattdessen muss er
+Ressourcen explizit von den Speicher- und PCI-Diensten des Kernels anfordern.
+
+\subsection{Funktionale Anforderungen: Die Befehlspipeline}
+Der Treiber muss einen bidirektionalen Kommunikationskanal zwischen dem
+Gast-Betriebssystem und der Host-VMM bereitstellen.
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{PCI-Bus-Enumeration:} Der Treiber muss mit dem hhuOS-PCI-Manager interagieren, um das VirtIO-GPU-Gerät (ID \texttt{0x1050}) zu lokalisieren und seine herstellerspezifischen Capabilities zu analysieren, damit die MMIO-Offsets für die Konfiguration bestimmt werden können.
+    \item \textbf{2D-Ressourcenverwaltung:} Der Treiber muss die Logik implementieren, um hostseitige Texturen (Resources) zu erstellen, Gast-RAM-Seiten als Backing Stores anzuhängen und den Lebenszyklus dieser Ressourcen zu verwalten, um Speicherlecks im Hypervisor zu verhindern.
+    \item \textbf{Synchrone und asynchrone E/A:} Während Frame-Aktualisierungen (\textit{Flushes}) asynchron ablaufen können, erfordern Steuerbefehle, etwa das Erstellen einer Ressource, einen synchronen Handshake, um sicherzustellen, dass die Ressourcen-ID vor der weiteren Verwendung gültig ist.
+\end{enumerate}
+
+\subsection{Nicht-funktionale Anforderungen: Sicherheit und Leistung}
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Strikte Isolierung:} Gemäß der Mikrokernel-Philosophie \cite{Liedtke1995} arbeitet der Treiber in seinem eigenen Adressraum. Fehler in der Behandlung des VirtIO-GPU-Protokolls müssen auf den Treiberprozess beschränkt bleiben, um eine systemweite Instabilität zu verhindern.
+    \item \textbf{Interrupt-Effizienz:} In einer virtualisierten Umgebung sind Interrupts (VM-Exits) teuer. Der Entwurf muss, wo immer möglich, MSI-X nutzen und für Hochdurchsatz-Szenarien den Polling-Modus unterstützen, um den Overhead von Kontextwechseln zu minimieren.
+\end{enumerate}
+
+\section{Gesamtarchitektur des Treibers}
+Der hhuOS-VirtIO-GPU-Treiber ist als modulares System konzipiert, das
+hochrangige Grafikaufrufe von den Interaktionen mit der zugrunde liegenden
+Hardware entkoppelt. Diese Modularität ist in Mikrokernel-Umgebungen, in denen
+Dienstgrenzen strikt eingehalten werden, von entscheidender Bedeutung.
+
+Die Architektur gliedert sich in drei primäre Funktionsbereiche:
+\begin{enumerate}
+    \item \textbf{Frontend-API-Schicht:} Diese Schicht stellt die Schnittstelle zum restlichen hhuOS-Ökosystem dar. Sie übersetzt generische Zeichen- oder Aktualisierungsanfragen in das logische VirtIO-GPU-Protokoll. Darüber hinaus verwaltet sie den virtuellen Framebuffer und stellt sicher, dass Pixeldaten auf Anwendungsebene korrekt für die GPU formatiert sind.
+    \item \textbf{Zentrale VirtIO-Engine:} Dies ist das Herzstück des Treibers. Sie enthält die Protokollhandler, die \texttt{VIRTIO\_GPU\_CMD}-Pakete erzeugen. Außerdem verwaltet sie die beiden obligatorischen Virtqueues: die \textit{Control Queue} für Ressourcenverwaltung und Initialisierung sowie die \textit{Cursor Queue} für hardwarebeschleunigte Mauszeiger.
+    \item \textbf{OS-spezifische HAL- und Schnittstellenschicht:} Diese Schicht bildet die Schnittstelle zu den hhuOS-Kerndiensten. Sie übernimmt das Einblenden von PCI-BARs in den Adressraum des Treibers, die Allokation physisch zusammenhängender DMA-Puffer sowie die Benachrichtigung des Hypervisors über die Notify-Register.
+\end{enumerate}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    >=Stealth,
+    comp/.style={rectangle, draw, text width=5cm, text centered, minimum height=1cm, rounded corners}
+]
+    \node[comp, fill=red!10] (app) {Benutzeranwendung (GUI/Kommandozeile)};
+    \node[comp, below=of app, fill=orange!10] (api) {hhuOS-Grafik-API};
+
+    \node[comp, fill=green!10, below=1.8cm of api] (core) {Zentrale VirtIO-GPU-Logik\\(Protokollhandler)};
+    \node[comp, fill=green!10, below=0.8cm of core] (vq) {Virtqueue-Engine};
+
+    \node[draw, dashed, inner sep=0.5cm, fit=(core) (vq), label=right:{\textbf{Treiberdomäne}}] (driverbox) {};
+
+    \node[comp, fill=gray!20, below=1.2cm of vq] (hal) {OS-spezifische HAL};
+    \node[comp, fill=yellow!10, below=of hal] (hw) {Hypervisor (QEMU/KVM)};
+
+    \draw[->, thick] (app) -- (api);
+    \draw[->, thick] (api) -- (core) node[midway, right] {Befehle};
+    \draw[->, thick] (core) -- (vq);
+    \draw[->, thick] (vq) -- (hal);
+    \draw[->, thick, dashed] (hal) -- (hw) node[midway, right] {DMA/MMIO};
+\end{tikzpicture}
+\captionof{figure}{Mehrschichtige Treiberarchitektur in hhuOS}
+\end{center}
+
+\section{Zentrale Datenstrukturen}
+Die Effizienz des Treibers hängt von Datenstrukturen ab, die präzise mit der
+VirtIO-1.2-Spezifikation übereinstimmen. Da das Gerät, also der Hypervisor,
+diese Strukturen direkt über DMA ausliest, sind Speicherausrichtung und
+Padding von zentraler Bedeutung.
+
+\subsection{Der Gerätezustand (VirtioGpuDevice)}
+Die zentrale Klasse \texttt{VirtioGpuDevice} verwaltet den Laufzeitzustand der
+Hardwareverbindung. Sie speichert die MMIO-Zeiger auf die PCI-BARs sowie die
+Instanzen der Virtqueues.
+
+\begin{lstlisting}[language=C++, basicstyle=\small\ttfamily, frame=single, caption=Zentrale Gerätestruktur]
+class VirtioGpuDevice {
+    // MMIO-Register
+    volatile CommonCfg* common_cfg;
+    volatile uint32_t* notify_reg;
+    volatile GpuConfig* gpu_cfg;
+
+    // Virtqueues
+    Virtqueue control_vq;
+    Virtqueue cursor_vq;
+
+    // Ressourcenverwaltung
+    uint32_t current_resource_id;
+    DmaBuffer framebuffer;
+};
+\end{lstlisting}
+
+\subsection{Die Split-Virtqueue-Strukturen}
+Die \textbf{Split Virtqueue} besteht aus drei Speicherbereichen, die zwischen
+Gast und Host gemeinsam genutzt werden. In hhuOS werden diese als ein einziger
+zusammenhängender DMA-Block alloziert, um die Adressübersetzung zu
+vereinfachen.
+
+\begin{enumerate}
+    \item \textbf{Deskriptortabelle:} Ein Array von 16-Byte-Einträgen, das Pufferadresse, Länge und Flags (z.\,B. \texttt{NEXT}, \texttt{WRITE}) definiert.
+    \item \textbf{Available Ring:} Ein vom Gast beschriebener Ringpuffer, der Indizes von Deskriptoren enthält, die zur Verarbeitung bereitstehen.
+    \item \textbf{Used Ring:} Ein vom Host beschriebener Ringpuffer, in dem das Gerät abgeschlossene Aufgaben meldet.
+\end{enumerate}
+
+\subsection{GPU-Steuerpakete}
+Die gesamte Kommunikation über die Control Queue verwendet einen
+Standard-Header (\texttt{virtio\_gpu\_ctrl\_hdr}). Diese Struktur stellt
+sicher, dass sich Gast und Host über den Befehlstyp und eventuelle Fehlercodes
+einig sind.
+
+\begin{lstlisting}[language=C++, basicstyle=\small\ttfamily, frame=single]
+struct virtio_gpu_ctrl_hdr {
+    uint32_t type;     // VIRTIO_GPU_CMD_*
+    uint32_t flags;
+    uint64_t fence_id;
+    uint32_t ctx_id;
+    uint32_t padding;
+};
+\end{lstlisting}
+
+\section{Detaillierter Initialisierungsablauf}
+Die Initialisierung eines VirtIO-1.2-Geräts ist eine empfindliche
+Zustandsmaschinen-Transition. Der hhuOS-Treiber stellt sicher, dass keine E/A
+versucht wird, bevor der Host das \texttt{FEATURES\_OK}-Bit bestätigt hat.
+
+\subsection{Phase 1: Erkennung und Capability-Mapping}
+Im Gegensatz zu Legacy-PCI-Geräten, die feste BAR-Offsets verwenden, nutzt
+VirtIO-GPU eine dynamische Liste von Capabilities. Der Treiber durchläuft die
+verkettete Liste der PCI-Capabilities, um
+\texttt{VIRTIO\_PCI\_CAP\_COMMON\_CFG} und
+\texttt{VIRTIO\_PCI\_CAP\_NOTIFY\_CFG} zu finden. Dadurch kann der Treiber auch
+moderne Hypervisoren unterstützen, bei denen die Benachrichtigungsregister in
+einem anderen BAR liegen als die Konfigurationsregister.
+
+\subsection{Phase 2: Der Handshake}
+Der Treiber folgt der in \cite{Virtio12} definierten Sequenz:
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Reset:} Das Statusregister wird gelöscht, um einen sauberen Ausgangszustand zu gewährleisten.
+    \item \textbf{Feature-Verhandlung:} Der Treiber liest die 64-Bit-Feature-Bitmaske vom Gerät. Er muss \texttt{VIRTIO\_F\_VERSION\_1} aushandeln, um moderne 1.1-Features wie Little-Endian-Datenstrukturen zu aktivieren.
+\end{enumerate}
+
+\section{Entwurf der Hardwareabstraktionsschicht (HAL)}
+Eine wichtige Entwurfsentscheidung war die Implementierung einer dünnen HAL.
+Diese Schicht abstrahiert die kernelspezifischen Details von hhuOS, zum
+Beispiel:
+\begin{itemize}
+    \item \textbf{Speicherabbildung:} Übersetzung physischer PCI-Adressen in den virtuellen Adressraum des Treibers über die Schnittstelle \texttt{os\_map\_mmio()}.
+    \item \textbf{Physische Kontiguität:} Sicherstellung, dass DMA-Puffer physisch zusammenhängend sind. In hhuOS wird dies von einem speziellen DMA-Allokator übernommen, der die standardmäßige Heap-Allokation umgeht, um seitenausgerichtete und zusammenhängende Blöcke bereitzustellen.
+\end{itemize}
+
+\section{Speicherverwaltung: Die semantische Lücke}
+Einer der komplexesten Aspekte der GPU-Virtualisierung ist die Überbrückung der
+„semantischen Lücke“. Das Gast-Betriebssystem weiß, welche Pixel es zeichnen
+möchte, aber die Host-GPU kann nicht direkt auf den privaten Speicher des Gasts
+zugreifen.
+
+\subsection{Direct Memory Access (DMA) und Pinnen}
+Um dieses Problem zu lösen, implementiert der Treiber einen
+Backing-Store-Mechanismus. Wenn ein Framebuffer in hhuOS alloziert wird, muss
+der Treiber die entsprechenden Seiten pinnen. Dadurch wird sichergestellt, dass
+der hhuOS-Kernel diese Seiten nicht auslagert oder neu zuweist, während die
+Host-GPU daraus liest.
+
+\begin{center}
+\begin{tikzpicture}[>=Stealth, font=\small]
+    \node[draw, fill=blue!10, text width=3.5cm, align=center] (gva) {Gast-virtuell\\(hhuOS-Anwendung)};
+    \node[draw, fill=green!10, right=2cm of gva, text width=3.5cm, align=center] (gpa) {Gast-physisch\\(RAM)};
+    \node[draw, fill=red!10, right=2cm of gpa, text width=3.5cm, align=center] (hpa) {Host-physisch\\(VRAM)};
+
+    \draw[->, thick] (gva) -- (gpa) node[midway, above] {MMU};
+    \draw[->, thick] (gpa) -- (hpa) node[midway, above] {EPT/SLAT};
+
+    \node[below=0.5cm of gpa, text width=5cm, align=center, font=\itshape] {Der VirtIO-GPU-Treiber arbeitet auf dieser Ebene und übergibt GPA an den Host.};
+\end{tikzpicture}
+\captionof{figure}{Dreistufige Adressübersetzung bei VirtIO}
+\end{center}
+
+\section{Virtqueue-Entwurf und Synchronisation}
+Die Virtqueue ist die primäre Abstraktion für asynchrone Datenübertragung in
+VirtIO. Für den GPU-Treiber wird eine \textbf{Split-Virtqueue}-Architektur
+verwendet. Dieser Entwurf basiert auf einem gemeinsam genutzten
+Ringpufferprotokoll, das teure VM-Exits durch die Bündelung von Befehlen
+minimiert.
+
+\subsection{Deskriptorverkettung und Anordnung}
+Jeder GPU-Befehl besteht aus einem Anforderungs-Header, der vom Gerät gelesen
+wird, und einem Antwort-Header, der vom Gerät beschrieben wird. Da sich beide
+an unterschiedlichen Speicherorten befinden, wird \textbf{Deskriptorverkettung}
+verwendet. Ein einzelner logischer Befehl wird dabei durch zwei oder mehr
+Deskriptoren dargestellt, die über das \texttt{NEXT}-Flag miteinander
+verknüpft sind.
+
+\begin{center}
+\begin{tikzpicture}[node distance=0.5cm, font=\small]
+    \node[draw, fill=blue!5, minimum width=4cm] (desc0) {Desc 0: [Header GPA, Länge, NEXT]};
+    \node[draw, fill=green!5, below=of desc0, minimum width=4cm] (desc1) {Desc 1: [Antwort GPA, Länge, WRITE]};
+
+    \draw[->, thick] (desc0.east) .. controls +(right:1cm) and +(right:1cm) .. (desc1.east)
+        node[midway, right] {Verkettet};
+
+    \node[draw, dashed, inner sep=0.2cm, fit=(desc0) (desc1), label=left:{Logischer Befehl}] {};
+\end{tikzpicture}
+\captionof{figure}{Virtqueue-Deskriptorverkettung für GPU-Befehle}
+\end{center}
+
+\subsection{Der Synchronisations-Handshake}
+Um die Konsistenz zwischen dem hhuOS-Treiber als Produzent und dem Hypervisor
+als Konsument zu wahren, wird ein strenges Speicherordnungssprotokoll
+eingehalten. Dadurch wird verhindert, dass der Host teilweise geschriebene
+Deskriptoren liest.
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Payload schreiben:} Der Treiber schreibt die Befehlsdaten in den DMA-Puffer.
+    \item \textbf{Deskriptor einrichten:} Der Treiber füllt die Deskriptortabelle mit der physischen Adresse des Puffers.
+    \item \textbf{Speicherbarriere (SFENCE):} Ein \texttt{SFENCE}-Befehl stellt sicher, dass alle vorherigen Speicheroperationen für andere Prozessoren und die Host-CPU sichtbar sind, bevor der Available-Index aktualisiert wird \cite{Virtio12}.
+    \item \textbf{Available-Index aktualisieren:} Der Treiber erhöht den Index im Available Ring.
+    \item \textbf{Benachrichtigen (Kick):} Der Treiber schreibt in das PCI-Notify-Offset. Dies löst einen VM-Exit aus und signalisiert dem Host, mit der Verarbeitung zu beginnen.
+\end{enumerate}
+
+\subsection{Der Benachrichtigungszyklus im Überblick}
+Die Interaktion zwischen der Benachrichtigung durch den Treiber und der
+späteren Rückmeldung des Geräts wird im Folgenden dargestellt:
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=2cm,
+    >=Stealth,
+    state/.style={
+        rectangle,
+        rounded corners,
+        draw,
+        text width=1.6cm,
+        align=center,
+        minimum height=1.2cm
+    }
+]
+    \node[state, fill=blue!10] (start) {Treiber\\Vorbereitung};
+    \node[state, fill=gray!10, right=of start] (avail) {Available\\Ring\\aktualisieren};
+    \node[state, fill=red!10, right=of avail] (kick) {Türklingel\\(Notify)};
+    \node[state, fill=green!10, below=of kick] (host) {Host\\Verarbeitung};
+    \node[state, fill=blue!10, left=of host] (used) {Used Ring\\aktualisieren};
+
+    \draw[->, thick] (start) -- (avail);
+    \draw[->, thick] (avail) -- (kick);
+    \draw[->, thick] (kick) -- node[right] {VM-Exit} (host);
+    \draw[->, thick] (host) -- (used);
+    \draw[->, thick] (used) -- node[left] {Interrupt} (start);
+\end{tikzpicture}
+\captionof{figure}{Asynchroner Befehlslebenszyklus und Signalisierung}
+\end{center}
+
+\paragraph{Konkretes Beispiel: \texttt{RESOURCE\_FLUSH} über die Control Queue}
+Abbildung~\ref{fig:virtqueue-resource-flush} zeigt einen beispielhaften
+Befehlsablauf über die Control Queue am Beispiel von
+\texttt{RESOURCE\_FLUSH}. Der Treiber verbindet zunächst Anfrage und Antwort
+über eine Deskriptorkette, trägt den Kopf der Kette in den Available Ring ein
+und benachrichtigt den Host über das Notify-Register. Nach der Verarbeitung
+aktualisiert der Host den Used Ring und stellt die Antwort im vorgesehenen
+Puffer bereit. Der Treiber kann danach den Abschluss des Befehls auswerten und
+die weitere Verarbeitung fortsetzen.
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.6cm and 1.4cm,
+    box/.style={
+        draw,
+        rounded corners=3pt,
+        align=center,
+        minimum width=3.2cm,
+        minimum height=1.1cm,
+        font=\small
+    },
+    arrow/.style={
+        -{Latex[length=2.5mm]},
+        thick
+    },
+    step/.style={
+        circle,
+        draw,
+        inner sep=1pt,
+        minimum size=16pt,
+        font=\scriptsize
+    }
+]
+
+\node[box] (req) {Request-Header\\Descriptor 0};
+\node[box, right=of req] (resp) {Response-Puffer\\Descriptor 1};
+
+\node[box, below=1.8cm of req] (avail) {Available Ring};
+\node[box, right=of avail] (notify) {Notify-Register};
+\node[box, right=1.8cm of notify] (host) {Host verarbeitet\\\texttt{RESOURCE\_FLUSH}};
+\node[box, below=1.8cm of host] (used) {Used Ring};
+\node[box, left=of used] (driver) {Treiber liest\\Antwort aus};
+
+\draw[arrow] (req) -- (resp);
+\node[step, above=1mm of $(req)!0.5!(resp)$] {1};
+
+\draw[arrow] (req) -- (avail);
+\node[step, left=2mm of $(req)!0.5!(avail)$] {2};
+
+\draw[arrow] (resp) -- (avail);
+\node[step, right=2mm of $(resp)!0.5!(avail)$] {2};
+
+\draw[arrow] (avail) -- (notify);
+\node[step, above=1mm of $(avail)!0.5!(notify)$] {3};
+
+\draw[arrow] (notify) -- (host);
+\node[step, above=1mm of $(notify)!0.5!(host)$] {4};
+
+\draw[arrow] (host) -- (used);
+\node[step, right=1mm of $(host)!0.5!(used)$] {5};
+
+\draw[arrow] (used) -- (driver);
+\node[step, above=1mm of $(used)!0.5!(driver)$] {6};
+
+\end{tikzpicture}
+
+\vspace{0.5em}
+
+\begin{minipage}{0.9\textwidth}
+\footnotesize
+\textbf{Ablauf:}
+(1) Anfrage und Antwort werden über eine Deskriptorkette verbunden.
+(2) Der Kettenkopf wird in den Available Ring eingetragen.
+(3) Der Treiber benachrichtigt den Host über das Notify-Register.
+(4) Der Host verarbeitet den Befehl \texttt{RESOURCE\_FLUSH}.
+(5) Der Abschluss wird im Used Ring eingetragen.
+(6) Der Treiber liest die Antwort aus.
+\end{minipage}
+
+\captionof{figure}{Beispielhafter Befehlsablauf über die Control Queue am Beispiel von \texttt{RESOURCE\_FLUSH}}
+\label{fig:virtqueue-resource-flush}
+\end{center}
+
+\subsection{Synchrone Wait-Used-Logik}
+Obwohl die Virtqueue grundsätzlich asynchron arbeitet, benötigt hhuOS für
+Einrichtungsbefehle, z.\,B. \texttt{RESOURCE\_CREATE\_2D}, ein synchrones
+Verhalten. Der Treiber implementiert daher eine Polling-Schleife, die den
+\texttt{used\_idx} des Used Rings überprüft. Um Systemabstürze zu verhindern,
+ist ein Watchdog-Timer integriert:
+\begin{equation}
+    T_{\text{verstrichen}} > T_{\text{timeout}} \implies \text{Geräte-Reset}
+\end{equation}
+Wenn der Host den Deskriptor nicht innerhalb von 1000\,ms zurückgibt,
+protokolliert der hhuOS-Kernel einen fatalen Treiberfehler und versucht, die
+VirtIO-Zustandsmaschine zurückzusetzen.
+
+\section{Fazit des Systementwurfs}
+Die in diesem Kapitel durchgeführte Analyse bestätigt, dass das
+VirtIO-1.2-Protokoll in Kombination mit einer robusten HAL und einer strengen
+Speicherverwaltung in hhuOS die notwendige Infrastruktur für einen
+leistungsfähigen Grafikstack bereitstellt. Durch die Betonung der
+Paravirtualisierung gegenüber der Emulation wird der VM-Exit-Overhead erheblich
+reduziert und die Grundlage für die in Kapitel~4 beschriebene Implementierung
+geschaffen.
+
+\newpage

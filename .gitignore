@@ -1,0 +1,19 @@
+# Temporary files
+*.aux
+*.log
+*.toc
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# Compiled C++ files
+*.o
+*.obj
+
+# Editor files
+.vscode/
+.idea/
+
+# Build output
+build/

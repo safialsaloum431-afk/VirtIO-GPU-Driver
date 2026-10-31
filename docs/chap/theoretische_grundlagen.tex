@@ -1,0 +1,162 @@
+\chapter{Theoretischer Hintergrund und verwandte Arbeiten}
+
+\section{Virtualisierungskonzepte und die x86-Architektur}
+Virtualisierung ist der architektonische Prozess der Entkopplung physischer Hardware von den darauf ausgeführten Softwareebenen. Im Kontext des hhuOS-Forschungskernels ist Virtualisierung nicht nur eine Kompatibilitätsschicht, sondern ein Sicherheitsprimitiv, das eine starke Isolierung zwischen Gerätetreibern und der Kernlogik des Kernels ermöglicht.
+
+\subsection{Architektonische Privilegien: VMX-Root und Non-Root}
+Die x86-Architektur erfüllte ursprünglich die Virtualisierungsanforderungen von Popek und Goldberg nicht, da bestimmte Befehle sich je nach Privilegienstufe unterschiedlich verhielten, ohne Traps auszulösen. Dies wurde mit Intel VT-x durch die Einführung von VMX (Virtual Machine Extensions) behoben.
+
+Der Prozessor arbeitet in zwei sich gegenseitig ausschließenden Modi:
+\begin{enumerate}
+    \item \textbf{VMX-Root-Betrieb:} Im Allgemeinen für den Hypervisor reserviert. Die CPU hat die volle Kontrolle über den Systemzustand und kann physische Register manipulieren.
+    \item \textbf{VMX-Non-Root-Betrieb:} Die Umgebung für das Gast-Betriebssystem (hhuOS). Selbst wenn der Gastkernel in Ring 0 läuft, lösen sensible Befehle (z. B. \texttt{HLT}, \texttt{CPUID} oder MMIO-Zugriffe) einen \textbf{VM-Exit} aus.
+\end{enumerate}
+
+Die Leistung eines VirtIO-GPU-Treibers ist untrennbar mit der Häufigkeit dieser Übergänge verbunden. Jeder VM-Exit erfordert, dass der Prozessor den Gastzustand in der VMCS (Virtual Machine Control Structure) speichert, was über 1.500–3.000 Taktzyklen verbraucht. Ein wichtiges Entwurfsziel von VirtIO ist es, Befehle zu bündeln, um diese Übergänge zu minimieren.
+
+\subsection{Speicheradressübersetzung: Der verschachtelte Durchlauf (Nested Walk)}
+Die Virtualisierung führt eine zusätzliche Ebene der Speicheradressierung ein. In hhuOS
+verwaltet der Treiber Gast-Virtual-Adressen (GVA), die über die zweistufigen
+Seitentabellen des Gasts in Gast-Physische-Adressen (GPA) übersetzt werden. Für den
+tatsächlichen Zugriff auf den Arbeitsspeicher wird die GPA anschließend über die
+Extended Page Tables (EPT) des Hosts in eine Host-Physische-Adresse (HPA) überführt.
+
+Wie in Abbildung~2.1 gezeigt, ergibt sich damit ein verschachtelter
+Übersetzungsvorgang:
+$$ (GVA \to GPA)_{\text{Gast}} \times (GPA \to HPA)_{\text{Host}} $$
+
+Dieser zusätzliche Übersetzungsschritt erhöht den Aufwand der Speicheradressierung.
+Für GPU-Treiber ist daher die DMA-Verwaltung besonders wichtig, da alle an das
+VirtIO-GPU-Gerät übergebenen Puffer stabil im Gast-Physikraum referenzierbar sein
+müssen.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=1.2cm, >=Stealth, font=\small]
+    \node (gva) [rectangle, draw, fill=blue!10] {Gast-Virtual-Adresse (GVA)};
+    \node (pt1) [rectangle, draw, below=of gva] {Gast-Seitentabellen (2-stufig)};
+    \node (gpa) [rectangle, draw, fill=green!10, below=of pt1] {Gast-Physische-Adresse (GPA)};
+    \node (ept) [rectangle, draw, below=of gpa] {Extended Page Tables (EPT)};
+    \node (hpa) [rectangle, draw, fill=red!10, below=of ept] {Host-Physische-Adresse (HPA)};
+
+    \draw[->] (gva) -- (pt1);
+    \draw[->] (pt1) -- (gpa) node[midway, right] {hhuOS-Steuerung};
+    \draw[->] (gpa) -- (ept);
+    \draw[->] (ept) -- (hpa) node[midway, right] {Hypervisor-Steuerung};
+\end{tikzpicture}
+\caption{Verschachtelte Speicherübersetzung in einer virtualisierten 32-Bit-Umgebung}
+\end{figure} 
+
+\section{VirtIO-Architektur und Standardisierung}
+VirtIO wurde entwickelt, um paravirtualisierte E/A zu standardisieren. Durch die Verwendung eines standardisierten Busses (PCI) und einer gemeinsamen Ringpufferstruktur (Virtqueues) wird die Notwendigkeit für die VMM beseitigt, Hunderte von Legacy-Gerätefehlern zu emulieren.
+
+\subsection{Die Initialisierungs-Zustandsmaschine}
+Die VirtIO 1.2-Spezifikation schreibt ein streng sequenzielles Initialisierungsprotokoll vor. Dies stellt sicher, dass Gast und Host eine synchronisierte Sicht auf die Gerätefähigkeiten haben, bevor irgendwelche MMIO- oder DMA-Operationen stattfinden. Der Fortschritt wird durch das \textbf{Device Status Register} gesteuert, ein 8-Bit-Feld in der gemeinsamen Konfigurationsstruktur \cite{Virtio12}.
+
+\subsubsection{Schritt-für-Schritt-Initialisierungsprotokoll}
+Der Treiber muss die folgenden Zustände durchlaufen. Das Überspringen eines Schritts oder das Schreiben einer ungültigen Bitsequenz löst die Bedingung \texttt{DEVICE\_NEEDS\_RESET} aus.
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Reset (0x00):} Nach der Entdeckung schreibt der Treiber 0 in das Statusregister. Dies löscht alle alten Zustände im Backend und setzt die Virtqueues zurück.
+    \item \textbf{ACKNOWLEDGE (0x01):} Der Gast benachrichtigt den Host, dass er das Gerät bemerkt hat. Dies ist das erste „Ich bin da“-Signal.
+    \item \textbf{DRIVER (0x02):} Der Gast zeigt an, dass er einen passenden Treiber (den hhuOS-VirtIO-GPU-Treiber) besitzt und in der Lage ist, das Gerät zu verwalten.
+    \item \textbf{FEATURES\_OK (0x08):} Dies ist die kritischste Phase. Der Treiber liest die \texttt{device\_features} (eine 32-Bit- oder 64-Bit-Bitmaske, die vom Host bereitgestellt wird) und schreibt die \texttt{driver\_features} zurück (die Teilmenge, die er tatsächlich unterstützt). Nach dem Schreiben liest der Treiber das Statusregister erneut, um sicherzustellen, dass der Host die Teilmenge akzeptiert hat.
+    \item \textbf{Virtqueue-Einrichtung:} Während des Zustands \texttt{FEATURES\_OK}, aber vor dem Setzen von \texttt{DRIVER\_OK}, muss der Treiber physischen Speicher für die Virtqueues allozieren und ihre physischen Adressen in das Konfigurations-BAR schreiben.
+    \item \textbf{DRIVER\_OK (0x04):} Das endgültige „Los“-Signal. Erst nachdem dieses Bit gesetzt ist, kann das Gerät mit der Verarbeitung von Deskriptoren aus dem Available Ring beginnen.
+\end{enumerate}
+
+\subsubsection{Feature-Verhandlung und der Version-1.1+-Handshake}
+Für einen modernen Treiber in hhuOS ist die Verhandlung von \texttt{VIRTIO\_F\_VERSION\_1} zwingend erforderlich. Dieses Bit signalisiert, dass das Gerät der modernen Spezifikation (Little-Endian-Zugriff, speicherabgebildete Fähigkeiten) folgt und nicht dem Legacy-Standard 0.9.5.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=1.5cm, auto, >=Stealth, 
+    box/.style={rectangle, draw, text width=5cm, align=left, rounded corners, fill=white, font=\small},
+    host/.style={fill=blue!5},
+    guest/.style={fill=green!5}]
+    
+    \node[box, guest] (g1) {1. Gast schreibt \textbf{ACKNOWLEDGE}};
+    \node[box, guest, below=of g1] (g2) {2. Gast schreibt \textbf{DRIVER}};
+    \node[box, host, below=of g2] (h1) {3. Host bietet \textbf{Device Features} an \\ (z.B. EDID, VIRGL, VERSION\_1)};
+    \node[box, guest, below=of h1] (g3) {4. Gast akzeptiert Teilmenge der Features \\ und schreibt \textbf{FEATURES\_OK}};
+    \node[box, host, below=of g3] (h2) {5. Host validiert die Teilmenge. \\ Bei Ungültigkeit setzt er \textbf{NEEDS\_RESET}};
+    \node[box, guest, below=of h2] (g4) {6. Gast überprüft, ob \textbf{FEATURES\_OK} noch gesetzt ist.};
+
+    \draw[->, thick] (g1) -- (g2);
+    \draw[->, thick] (g2) -- (h1);
+    \draw[->, thick] (h1) -- (g3);
+    \draw[->, thick] (g3) -- (h2);
+    \draw[->, thick] (h2) -- (g4);
+    
+    \draw [decorate, decoration={brace, amplitude=10pt, raise=4pt}, thick]
+      (h1.north east) -- (g4.south east) node [midway, xshift=1.5cm, rotate=-90, anchor=south] {Feature-Verhandlungsschleife};
+\end{tikzpicture}
+\caption{Detaillierte Logik der Feature-Verhandlung}
+\end{figure}
+
+\subsubsection{Der Ausfallsicherungsmechanismus: DEVICE\_NEEDS\_RESET}
+Die Zustandsmaschine enthält eine Sicherung gegen asynchrone Fehler. Wenn der Hypervisor auf einen schwerwiegenden Backend-Fehler stößt (z.B. eine ungültige DMA-Adresse oder einen Protokollverstoß), setzt er das \textbf{DEVICE\_NEEDS\_RESET} (0x40)-Bit. Der hhuOS-Treiber muss dieses Bit regelmäßig abfragen oder während der Interruptbehandlung überprüfen. Sobald es gesetzt ist, wird das Gerät zu einem „Zombie“ – es ignoriert alle weiteren Benachrichtigungen, bis die Initialisierungssequenz bei 0x00 neu gestartet wird \cite{Virtio12, IntelSDM}.
+
+\subsubsection{Auswirkungen auf die hhuOS-Integration}
+In der hhuOS-Implementierung wird diese Zustandsmaschine innerhalb der Methode \texttt{VirtioGpuDevice::init()} implementiert. Eine häufige Fehlerquelle, die in dieser Arbeit behandelt wird, ist der Zeitpunkt der Virtqueue-Allokation. Gemäß der Spezifikation müssen die Host-Physischen-Adressen (HPA) der Deskriptortabellen in das gemeinsame Konfigurations-BAR geschrieben werden, \textit{nachdem} die Feature-Verhandlung abgeschlossen ist, aber \textit{bevor} \texttt{DRIVER\_OK} gesetzt wird. Die Nichteinhaltung dieser Reihenfolge führt dazu, dass der Host die „Türklingel“-Benachrichtigungen (Doorbell) ignoriert, da das Backend noch nicht weiß, welche Speicherbereiche es auf Befehle überwachen soll.
+
+\section{Der Virtqueue-Mechanismus: Tiefergehende Betrachtung}
+Der Virtqueue ist die Hochleistungs-Transportschicht. In hhuOS implementieren wir den Split Virtqueue, der aus drei verschiedenen Speicherbereichen besteht, die an der Cache-Linie ausgerichtet sein müssen (normalerweise 64 Byte).
+
+\subsection{Deskriptorverkettung und Gather-Write}
+VirtIO-GPU-Befehle erstrecken sich oft über mehrere nicht zusammenhängende Speicherseiten. Dies wird durch Deskriptorverkettung (Descriptor Chaining) gehandhabt. Jeder Deskriptor enthält einen \texttt{NEXT}-Zeiger und ein \texttt{FLAGS}-Feld.
+\begin{itemize}
+    \item \textbf{VIRTQ\_DESC\_F\_NEXT:} Zeigt an, dass der Befehl im nächsten Deskriptoreintrag fortgesetzt wird.
+    \item \textbf{VIRTQ\_DESC\_F\_WRITE:} Zeigt an, dass der Speicher für das Gerät zum Schreiben (Antworten) bestimmt ist.
+\end{itemize}
+
+\subsection{Speicherreihenfolge und der Fence-Mechanismus}
+Da der Host (Backend) und der Gast (Frontend) separate Ausführungskontexte sind, ist die Speichersichtbarkeit nicht garantiert.
+1. Der Gast schreibt den Befehl in die Deskriptortabelle.
+2. Der Gast führt eine Store-Store-Barriere (\texttt{sfence} auf x86) aus, um sicherzustellen, dass die Tabelle aktualisiert ist, bevor das Gerät sie sieht.
+3. Der Gast aktualisiert den Index des Available Ring.
+4. Der Gast „tritt“ (kick) das Gerät, indem er in das Notify-BAR schreibt.
+
+\section{VirtIO-GPU-Protokoll und 2D-Rendering-Pipeline}
+Das VirtIO-GPU-Gerät ist im Wesentlichen ein befehlsbasierter Stream-Prozessor. Im Gegensatz zu einer VGA-Karte, bei der man in einen Framebuffer schreibt, sendet man bei VirtIO-GPU Anweisungen zur Manipulation von Ressourcen (Resources).
+
+\subsection{Der Lebenszyklus eines 2D-Befehls}
+Der Lebenszyklus eines Frames in hhuOS wird durch fünf primäre Befehle gesteuert:
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=1.5cm, >=Stealth, block/.style={rectangle, draw, text width=8cm, text centered, rounded corners, minimum height=1cm}]
+    \node[block, fill=blue!5] (c1) {1. RESOURCE\_CREATE\_2D \\ (Allokiert Host-VRAM)};
+    \node[block, fill=blue!5, below=of c1] (c2) {2. RESOURCE\_ATTACH\_BACKING \\ (Verbindet Gast-RAM mit der Ressource)};
+    \node[block, fill=blue!5, below=of c2] (c3) {3. SET\_SCANOUT \\ (Weist Ressource dem Display zu)};
+    \node[block, fill=orange!10, below=of c3] (c4) {4. TRANSFER\_TO\_HOST\_2D \\ (Kopiert hhuOS-Pixel zum Host)};
+    \node[block, fill=green!10, below=of c4] (c5) {5. RESOURCE\_FLUSH \\ (Löst physische Aktualisierung aus)};
+
+    \draw[->, thick] (c1) -- (c2);
+    \draw[->, thick] (c2) -- (c3);
+    \draw[->, thick] (c3) -- (c4);
+    \draw[->, thick] (c4) -- (c5);
+    \draw[->, thick] (c5.east) -- ++(1,0) -- ++(0, 1.5) |- (c4.east) node[midway, right] {Pro-Frame-Schleife};
+\end{tikzpicture}
+\caption{Flussdiagramm der VirtIO-GPU-2D-Rendering-Pipeline}
+\end{figure}
+
+Dieses „Transfer-then-Flush“-Modell ist der Kern der Effizienz von VirtIO-GPU. Es erlaubt dem Gast, Tausende von lokalen Speicherschreibvorgängen ohne VM-Exits durchzuführen und nur dann zum Hypervisor zu wechseln, wenn ein vollständiger Frame zur Anzeige bereit ist \cite{Belkhiri2024, Virtio12}.
+
+\section{Vergleich virtualisierter Grafiklösungen}
+Die folgende Tabelle fasst die während der architektonischen Phase der hhuOS-Entwicklung untersuchten Kompromisse zusammen.
+\begin{table}[H]
+\centering
+\caption{Taxonomie der Grafikvirtualisierungstechniken}
+\begin{tabular}{l p{3cm} p{3.5cm} p{3cm}}
+\toprule
+\textbf{Merkmal} & \textbf{Emulierte VGA} & \textbf{SR-IOV / Passthrough} & \textbf{VirtIO-GPU} \\ \midrule
+\textbf{Mechanismus} & Trap-and-Emulate & Hardware-Partitionierung & Paravirtualisierung \\
+\textbf{VM-Exits} & Einer pro Pixel-Schreibzugriff & Minimal & Einer pro Flush \\
+\textbf{Treiberanforderung} & Generisch (VGA) & Nativer Herstellertreiber & VirtIO-Standard \\
+\textbf{Portabilität} & Universell & Hardwaregebunden & Spezifikationsbasiert \\ \bottomrule
+\end{tabular}
+\end{table}
+
+Wie von Silberschatz et al. \cite{Silberschatz2021} angemerkt, bietet Passthrough zwar die höchste Leistung, verletzt jedoch das grundlegende Mikrokernel-Prinzip der Hardwareabstraktion. VirtIO-GPU bietet eine „semantische Brücke“ – der Host versteht, dass der Gast eine „Flush“-Operation durchführt, was Optimierungen wie hostseitige Hardwareskalierung oder Komprimierung ermöglicht, die mit reiner VGA-Emulation nicht möglich sind.
+\newpage

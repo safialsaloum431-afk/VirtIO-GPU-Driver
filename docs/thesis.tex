@@ -1,0 +1,21 @@
+\PassOptionsToPackage{final}{graphicx}
+\documentclass{class/thesis}
+\input{properties}
+
+\usepackage{pgfplots}
+\pgfplotsset{compat=newest}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc}
+
+\begin{document}
+
+\begin{thesis}
+    \include{chap/einleitung}
+    \include{chap/theoretische_grundlagen}
+    \include{chap/systemanalyse_und_treiberentwurf}
+    \include{chap/implementierung}
+    \include{chap/testen_und_validierung}
+    \include{chap/zusammenfassung_und_ausblick}
+\end{thesis}
+
+\end{document}

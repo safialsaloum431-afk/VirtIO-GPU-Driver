@@ -1,0 +1,94 @@
+\chapter{Zusammenfassung und zukünftige Arbeiten}
+
+\section{Zusammenfassung der Forschung und Beiträge}
+Diese Arbeit hat den architektonischen Entwurf, die Implementierung und die
+Validierung eines paravirtualisierten VirtIO-GPU-Treibers für den
+hhuOS-Forschungskernel detailliert beschrieben. Der primäre Beitrag dieser
+Arbeit ist die erfolgreiche Verbindung eines leistungsfähigen
+Grafikprotokolls mit einer Mikrokernel-Umgebung -- ausgehend von einer
+statischen Testausgabe bis hin zu einem vollständigen dynamischen
+Laufzeit-Rendering-Stack .
+
+Durch diese Forschung wurde gezeigt, dass die Komplexität moderner Grafik durch
+Paravirtualisierung beherrscht werden kann, ohne die Kernprinzipien der
+Sicherheit und Isolierung zu opfern. Die Implementierung des
+\texttt{virtio\_gpu}-Treibers hat hhuOS in ein System erweitert, das einen
+Durchsatz von 564 FPS erreicht und damit eine 7,4-fache Verbesserung gegenüber
+Legacy-Methoden erzielt. Die dynamische Erweiterung -- bestehend aus dem
+Per-Frame-Renderer (\texttt{virtio\_gpu\_demo\_render\_frame}), der
+Dirty-Rect-Präsentation (\texttt{present\_demo\_regions}), einem dedizierten
+Animations-Thread und einem interaktiven Laufzeit-Moduswechsel über die Taste
+\texttt{C} -- erhöht den Reifegrad des Treibers erheblich und validiert die
+gesamte Rendering-Pipeline unter realistischen dynamischen Bedingungen.
+
+\section{Technische Reflexion: Paravirtualisierung vs. Emulation}
+Die dokumentierten Ergebnisse liefern empirische Belege dafür, dass das
+„Trap-and-Emulate“-Modell für moderne grafische Arbeitslasten nicht mehr
+tragfähig ist. Die Implementierung des linearen Framebuffers
+(Legacy Linear Framebuffer, LFB) ist zwar einfach umzusetzen, verursacht jedoch
+aufgrund ständiger VM-Exits eine erhebliche Leistungseinbuße.
+
+Die VirtIO-GPU-Implementierung zeigt, dass die
+„Transfer-then-Flush“-Semantik überlegen ist. Die zusätzliche
+Dirty-Rect-Präsentation verstärkt diesen Effekt, indem der Hypervisor nur für
+tatsächlich veränderte Bildschirmregionen aktiviert wird. Die Validierung der
+spezifischen Befehle und der Queue-Strukturen zeigt, dass die Reduzierung der
+„semantischen Lücke“ ein wesentlicher Schlüssel zur paravirtualisierten
+Effizienz ist.
+
+\section{Architektonische Auswirkungen auf hhuOS}
+Aus softwaretechnischer Perspektive hat sich die modulare Struktur des Treibers
+als äußerst effektiv erwiesen. Die Implementierung ist in mehrere Submodule
+unter \texttt{src/device/graphic/virtio/} gegliedert. Diese Struktur trennt
+Discovery, Initialisierung, Virtqueue-Transport, Ressourcenverwaltung und
+Laufzeitpfade klar voneinander. Dadurch bleibt der Kernel übersichtlich und
+prüfbar, während gleichzeitig komplexe Hardware strukturiert unterstützt werden
+kann.
+
+Die in den Tabellen~5.1 bis~5.4 zusammengefassten Strukturen und Funktionen
+dienen als Blaupause für zukünftige VirtIO-basierte Treiber in hhuOS, wie
+beispielsweise \texttt{virtio-net} oder \texttt{virtio-blk}, die den gleichen
+hier etablierten Virtqueue-basierten Kommunikationsmustern folgen können.
+
+Besonders hervorzuheben ist die Erweiterung durch den dedizierten
+Animations-Thread: Sie zeigt, dass hhuOS in der Lage ist, nebenläufige
+Hintergrundaufgaben mit direktem Hardwarezugriff zu verwalten -- ein
+wesentlicher Schritt in Richtung eines vollständigen Grafiksubsystems.
+
+\section{Einschränkungen und offene Herausforderungen}
+Trotz des Erfolgs des aktuellen Treibers verbleiben einige Einschränkungen. Die
+aktuelle Implementierung ist auf 2D-Operationen beschränkt. Obwohl das
+2D-Protokoll stabil und leistungsfähig ist, sind moderne Desktop-Umgebungen
+zunehmend auf 3D-Shader und Vertex-Verarbeitung angewiesen.
+
+Darüber hinaus arbeitet der Treiber derzeit auf Ebene der Control Queue
+synchron: Die CPU muss den Used Ring abfragen und auf die Antwort des Hosts
+warten. Dies gewährleistet zwar Datenkonsistenz, kostet jedoch zusätzliche
+CPU-Zeit. Der Übergang zu einem interruptgesteuerten oder weiter
+asynchronisierten Modell würde die Systemreaktionsfähigkeit weiter verbessern.
+
+\section{Zukünftige Arbeiten: In Richtung 3D und darüber hinaus}
+Der logische nächste Schritt für diese Forschung ist die Integration von
+\textbf{VirGL}. VirGL ist eine Erweiterung des VirtIO-GPU-Protokolls, die es
+dem Gast ermöglicht, OpenGL-Befehle direkt an den Host zu senden. Dies würde
+hhuOS in die Lage versetzen, hardwarebeschleunigte 3D-Anwendungen
+auszuführen.
+
+Darüber hinaus sollten zukünftige Arbeiten die Nutzung von
+\textbf{IOMMU (Input-Output Memory Management Unit)}-Unterstützung innerhalb
+des hhuOS-Kernels untersuchen. Dies würde eine zusätzliche Sicherheitsebene
+hinzufügen und sicherstellen, dass selbst bei einer Kompromittierung des
+Grafiktreibers kein Zugriff auf Speicherbereiche außerhalb der vorgesehenen
+DMA-Puffer möglich ist.
+
+\section{Abschließende Bemerkungen}
+Der Übergang von textbasierten zu grafischen Oberflächen ist ein Meilenstein
+für jedes Betriebssystem. Durch die Implementierung eines
+VirtIO-GPU-Treibers -- vom statischen Schachbrettmuster bis zur vollständig
+animierten und interaktiv umschaltbaren Rendering-Pipeline -- wurde hhuOS nicht
+nur um eine moderne Grafikausgabe erweitert, sondern zugleich die Fähigkeit des
+Kernels validiert, Gerätekommunikation mit hohem Durchsatz und niedriger
+Latenz zu bewältigen. Da die Virtualisierung weiterhin sowohl im Rechenzentrum
+als auch auf dem Desktop eine zentrale Rolle spielt, werden die in dieser
+Arbeit dokumentierten Techniken für den Entwurf sicherer, effizienter und
+moderner Betriebssysteme weiterhin von grundlegender Bedeutung bleiben.

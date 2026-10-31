@@ -1,0 +1,336 @@
+\chapter{Implementierung des VirtIO-GPU-Treibers}
+
+Die Implementierung des VirtIO-GPU-Treibers in hhuOS ist eine mehrschichtige
+softwaretechnische Aufgabe. Sie überbrückt die Kluft zwischen hochrangigen
+Grafikaufrufen und der Kommunikation mit der zugrunde liegenden PCI-Hardware.
+Der Code ist architektonisch in mehrere Submodule unter
+\texttt{src/device/graphic/virtio/} gegliedert. Diese Aufteilung stellt sicher,
+dass Discovery, Initialisierung, Virtqueue-Transport, Control-Queue-Kommandos,
+Ressourcenverwaltung und Laufzeitpfade klar voneinander getrennt sind.
+
+\section{Geräteerkennung und Probe-Mechanismus}
+Der Lebenszyklus des Treibers beginnt mit der Erkennung der Hardware. In der
+hhuOS-Umgebung wird dies von der Funktion
+\texttt{virtio\_gpu\_probe\_all\_devices()} verwaltet.
+
+\subsection{PCI-Enumeration und Identifikation}
+Während des Kernel-Bootvorgangs, insbesondere im Einstiegspunkt
+\texttt{GatesOfHell.cpp} oder über einen Autostart-Hook, wird der PCI-Bus
+durchsucht. Der Treiber sucht nach der Hersteller-ID \texttt{0x1AF4}
+(Standard für VirtIO) und der Geräte-ID \texttt{0x1050} (VirtIO-GPU). Im
+Gegensatz zu älteren Treibern, die Speicheradressen fest kodieren, liest diese
+Implementierung dynamisch die Base Address Registers (BARs), um den
+Konfigurationsraum des Geräts zu lokalisieren.
+
+\subsection{Capability-Durchlauf und Abbildung}
+Ein wesentlicher Bestandteil der Implementierung ist die Routine
+\texttt{build\_regions\_from\_caps()}. VirtIO-1.2-Geräte nutzen eine verkettete
+Liste von PCI-Capabilities, um ihre Registerbereiche zu definieren
+\cite{Virtio12}. Der Treiber durchläuft diese Liste, um die obligatorischen
+Regionen \texttt{COMMON\_CFG}, \texttt{NOTIFY\_CFG} und \texttt{ISR\_CFG} sowie
+optional \texttt{DEVICE\_CFG} zu identifizieren.
+
+Die einzelnen Bereiche erfüllen dabei folgende Aufgaben:
+\begin{itemize}
+    \item \textbf{Common Configuration:} Wird für die Statusverwaltung, die Feature-Verhandlung und die Auswahl bzw. Konfiguration der Virtqueues verwendet.
+    \item \textbf{Notification Region:} Dient als „Türklingel“ (Doorbell), um dem Gerät neue Einträge im Available Ring zu signalisieren.
+    \item \textbf{ISR Configuration:} Dient der Rückmeldung von Interrupt- beziehungsweise Completion-relevanten Ereignissen.
+    \item \textbf{Device Configuration:} Stellt optionale gerätespezifische Daten wie Display-Parameter bereit.
+\end{itemize}
+
+Für jeden gefundenen Bereich ruft der Treiber die HAL-Funktion
+\texttt{os\_map\_mmio()} auf, um eine virtuelle Abbildung auf die physischen
+Hardware-Register zu erzeugen und diese für die weitere Initialisierung im
+Kernel verfügbar zu machen.
+
+\begin{center}
+\begin{tikzpicture}[node distance=1cm, >=Stealth, block/.style={rectangle, draw, fill=blue!10, text width=4cm, text centered, minimum height=1cm}]
+    \node [block] (pci) {PCI-Scan (\texttt{pci\_find\_first})};
+    \node [block, right=of pci] (caps) {Capability-Liste durchlaufen};
+    \node [block, right=of caps] (mmio) {BAR-Bereiche abbilden (MMIO)};
+    \node [block, below=of mmio] (init) {\texttt{virtio\_gpu\_try\_init()}};
+
+    \draw [->, thick] (pci) -- (caps);
+    \draw [->, thick] (caps) -- (mmio);
+    \draw [->, thick] (mmio) -- (init);
+
+    \node[draw, dashed, fit=(pci) (caps) (mmio), label=above:{\textbf{Probe-Phase (Kernel-Integration)}}] {};
+\end{tikzpicture}
+\captionof{figure}{Detaillierte Treibererkennungs- und Abbildungspipeline}
+\end{center}
+
+\section{Der VirtIO-Handshake und die Initialisierung}
+Nach der Abbildung der MMIO-Bereiche tritt der Treiber in die Funktion
+\texttt{virtio\_gpu\_try\_init()} ein. Diese folgt der strikten
+Zustandsmaschine der VirtIO-Spezifikation und stellt sicher, dass weder
+Queue-Zugriffe noch GPU-Kommandos stattfinden, bevor der Host die
+ausgehandelten Eigenschaften akzeptiert hat.
+
+\subsection{Feature-Verhandlung}
+In \texttt{negotiate\_features()} liest der Treiber die vom Gerät angebotenen
+Features als 64-Bit-Bitmaske in zwei 32-Bit-Fenstern aus. Anschließend wird
+konservativ nur die tatsächlich benötigte Teilmenge aktiviert. Zwingend ist
+dabei \texttt{VIRTIO\_F\_VERSION\_1}, da nur damit der moderne VirtIO-Pfad mit
+Little-Endian-Datenstrukturen und speicherabgebildeten Capabilities genutzt
+werden kann.
+
+Die Feature-Verhandlung folgt dabei dem üblichen Ablauf:
+\begin{enumerate}
+    \item Lesen der vom Gerät angebotenen Feature-Bits,
+    \item Auswahl der vom Treiber unterstützten Teilmenge,
+    \item Schreiben der akzeptierten Teilmenge in die Treiberregister,
+    \item Setzen von \texttt{FEATURES\_OK},
+    \item erneute Validierung, dass das Gerät dieses Bit weiterhin gesetzt lässt.
+\end{enumerate}
+
+Zusätzliche Features wie VirGL werden erkannt und intern vermerkt, sind jedoch
+nicht Bestandteil des aktuellen 2D-Hauptpfads. Die Implementierung verfolgt
+damit bewusst eine konservative Politik: Stabilität und Kompatibilität haben
+Vorrang vor einer frühzeitigen Aktivierung optionaler Erweiterungen.
+
+\subsection{Statusübergänge}
+Die Implementierung verwendet das Gerätestatusregister, um den Fortschritt der
+Initialisierung explizit zu signalisieren:
+\begin{enumerate}
+    \item \textbf{ACKNOWLEDGE:} Der Treiber hat das Gerät erkannt.
+    \item \textbf{DRIVER:} Der Treiber signalisiert, dass er das Gerät grundsätzlich ansteuern kann.
+    \item \textbf{FEATURES\_OK:} Gast und Host stimmen dem ausgehandelten Feature-Satz zu.
+    \item \textbf{DRIVER\_OK:} Die Initialisierung ist abgeschlossen; das Gerät ist betriebsbereit.
+\end{enumerate}
+
+Schlägt ein obligatorischer Schritt fehl, wird der Fehlerstatus gesetzt und die
+Initialisierung abgebrochen. Dadurch wird verhindert, dass ein teilweise
+initialisiertes Gerät in einen undefinierten Laufzeitzustand gelangt.
+
+\section{Virtqueue-Einrichtung und DMA-Verwaltung}
+Das Kommunikationsrückgrat des Treibers ist die \textbf{Split Virtqueue}. Die
+Funktion \texttt{virtqueue\_setup()} übernimmt die zentrale Speicherallokation
+und Konfiguration der Queue-Strukturen.
+
+\subsection{Speicherausrichtung und Allokation}
+Da der Hypervisor (QEMU/KVM) direkt auf den RAM des Gasts zugreift, muss der
+verwendete Speicher physisch zusammenhängend und passend ausgerichtet sein. Der
+Treiber verwendet \texttt{os\_alloc\_dma\_pages()}, um seitenausgerichtete
+Blöcke zu reservieren und sowohl virtuelle als auch physische Adressen für die
+weitere Queue-Konfiguration bereitzustellen.
+
+Innerhalb des allokierten DMA-Bereichs werden drei logisch getrennte Strukturen
+angelegt:
+\begin{itemize}
+    \item die \textbf{Deskriptortabelle},
+    \item der \textbf{Available Ring},
+    \item der \textbf{Used Ring}.
+\end{itemize}
+
+Die physischen Basisadressen dieser Bereiche werden anschließend in die
+Common-Configuration-Register des Geräts eingetragen. Erst danach kann die
+jeweilige Virtqueue aktiviert und für den Befehlsverkehr verwendet werden.
+
+\section{Das Control-Command-Protokoll}
+Die GPU wird über Befehle gesteuert, die an die \textit{Control Queue}
+(Warteschlange 0) gesendet werden. Die Funktion
+\texttt{control\_queue\_send()} implementiert einen synchronen Wrapper um die
+grundsätzlich asynchrone Virtqueue-Kommunikation.
+
+Dieser Ansatz erlaubt es der höheren Initialisierungslogik, mit einem einfachen
+Request-Response-Modell zu arbeiten, während die eigentliche Übertragung
+weiterhin dem VirtIO-Ringmechanismus folgt.
+
+\subsection{Vorab allozierte Befehlspuffer}
+Um Fragmentierung zu vermeiden und die Befehlsübertragung reproduzierbar zu
+halten, nutzt der Treiber vorab allozierte DMA-Puffer für Requests und
+Responses. Diese Puffer werden während der Initialisierung der Control Queue
+reserviert und anschließend für sämtliche Kommandos wiederverwendet.
+
+Die synchrone Übertragung eines GPU-Kommandos erfolgt über genau zwei
+Deskriptoren:
+\begin{itemize}
+    \item einen \textbf{Request-Deskriptor} für den Befehl,
+    \item einen \textbf{Response-Deskriptor} für die Antwort des Geräts.
+\end{itemize}
+
+Der Request-Puffer wird vom Gerät gelesen, während der Response-Puffer vom Gerät
+beschrieben wird. Beide Puffer werden über eine Deskriptorkette logisch zu
+einem gemeinsamen Kommando verbunden.
+
+\begin{center}
+\begin{tikzpicture}[font=\small,
+    mem/.style={rectangle, draw, fill=orange!5, text width=5.5cm, minimum height=0.8cm, text centered}]
+
+    \node [mem] (req) {Anforderungspuffer (\texttt{virtio\_gpu\_ctrl\_hdr} + Nutzdaten)};
+    \node [mem, below=0.2cm of req] (res) {Antwortpuffer (\texttt{virtio\_gpu\_ctrl\_hdr} + Fehlercode)};
+
+    \node [left=0.5cm of req] {Gast-RAM (DMA)};
+    \draw [->, thick, dashed] (req.east) -- +(1,0) node[right] {Gerät liest};
+    \draw [<-, thick, dashed] (res.east) -- +(1,0) node[right] {Gerät schreibt};
+\end{tikzpicture}
+\captionof{figure}{Speicheraufteilung für Anforderung und Antwort der Control Queue}
+\end{center}
+
+\subsection{Signalisierung und Polling}
+Nachdem Request- und Response-Puffer vorbereitet wurden, veröffentlicht der
+Treiber den Kopf der Deskriptorkette im Available Ring und benachrichtigt das
+Gerät über das Notify-Register. Anschließend wartet der Treiber auf den
+Abschluss im Used Ring.
+
+Der Ablauf ist dabei:
+\begin{enumerate}
+    \item Request in den DMA-Puffer kopieren,
+    \item Response-Puffer vorbereiten beziehungsweise leeren,
+    \item zwei Deskriptoren aufsetzen und verkettet publizieren,
+    \item Kettenkopf in den Available Ring eintragen,
+    \item Gerät per \texttt{virtqueue\_notify()} benachrichtigen,
+    \item auf Completion über \texttt{virtqueue\_wait\_used()} warten,
+    \item Antwort in den Aufruferpuffer übernehmen.
+\end{enumerate}
+
+Da die aktuelle Implementierung für Einrichtungs- und Kontrollkommandos ein
+synchrones Verhalten benötigt, wird eine Polling-Schleife mit Watchdog-Timer
+verwendet. Antwortet das Gerät nicht innerhalb des vorgegebenen Zeitfensters,
+wird ein Fehler protokolliert und der betreffende Schritt als fehlgeschlagen
+behandelt.
+
+\section{Framebuffer und Ressourcenlebenszyklus}
+Das eigentliche Ziel des Treibers ist die Bereitstellung eines sichtbaren
+Framebuffers. Dies wird in \texttt{create\_framebuffer\_resource()} realisiert,
+wo lokaler DMA-Speicher, VirtIO-GPU-Ressource und Scanout logisch miteinander
+verbunden werden.
+
+\subsection{Die 2D-Ressourcen-Pipeline}
+Die Erstellung und Sichtbarmachung eines Framebuffers folgt einer klaren
+Befehlskette:
+\begin{enumerate}
+    \item \textbf{RESOURCE\_CREATE\_2D:} Allokiert eine hostseitige 2D-Ressource für die angegebene Auflösung.
+    \item \textbf{RESOURCE\_ATTACH\_BACKING:} Verbindet Gast-RAM-Seiten mit der hostseitigen Ressource.
+    \item \textbf{SET\_SCANOUT:} Verbindet die Ressource mit dem virtuellen Monitor.
+    \item \textbf{TRANSFER\_TO\_HOST\_2D:} Überträgt die geänderten Pixelbereiche aus dem Gast-Framebuffer an den Host.
+    \item \textbf{RESOURCE\_FLUSH:} Signalisiert dem Host, die aktualisierten Bereiche sichtbar zu machen.
+\end{enumerate}
+
+Diese Trennung zwischen lokalem Schreiben in den Gast-Framebuffer und expliziter
+Präsentation gegenüber dem Host ist zentral für die Effizienz des Treibers. Der
+Gast kann seine Pixel zunächst vollständig lokal erzeugen, bevor nur die
+tatsächlich relevanten Bereiche an das Gerät übertragen und sichtbar gemacht
+werden.
+
+\section{Dynamisches Rendering, Animationsthread und Laufzeit-Umschalter}
+Nachdem die grundlegende statische Ausgabe (Schachbrettmuster) erfolgreich
+validiert wurde, wurde der Treiber um eine vollständige dynamische
+Rendering-Pipeline erweitert. Diese Erweiterung umfasst drei eng miteinander
+verbundene Subsysteme: den Per-Frame-Renderer, den dedizierten
+Animationsthread und einen Laufzeit-Moduswechsel per Tastatur.
+
+\subsection{Per-Frame-Renderer und Dirty-Rect-Präsentation}
+Der Kern der dynamischen Pipeline ist die Funktion
+\texttt{virtio\_gpu\_demo\_render\_frame(uint32\_t frame\_index)} in
+\texttt{virtio\_gpu\_resource.cpp}. Sie berechnet pro Frame die aktuellen
+Positionen aller animierten Objekte und zeichnet die Szene in den
+DMA-Framebuffer. Der \texttt{frame\_index}-Parameter steuert zeitbasierte
+Animationen (Translationen, Farbverläufe) ohne externe Zeitgeber
+deterministisch.
+
+Um unnötige Übertragungen zu vermeiden, implementiert der Treiber eine
+\textbf{Dirty-Rect-Präsentation}: Anstatt bei jeder Aktualisierung den
+gesamten Framebuffer zu übertragen, werden nur die tatsächlich geänderten
+Bereiche an den Host gemeldet.
+\begin{itemize}
+    \item \textbf{\texttt{present\_rect(x, y, w, h)}:} Sendet \texttt{TRANSFER\_TO\_HOST\_2D} und \texttt{RESOURCE\_FLUSH} für ein einzelnes Rechteck.
+    \item \textbf{\texttt{present\_demo\_regions(...)}:} Berechnet die Vereinigungsmenge aus alter und neuer Objektposition sowie dem HUD-Bereich und ruft \texttt{present\_rect} für die betroffenen Teilbereiche auf.
+\end{itemize}
+Dieses Muster reduziert die pro Frame übertragene Datenmenge erheblich und
+minimiert damit die Anzahl der VM-Exits, da der Hypervisor nur für die
+veränderten Bildschirmregionen aktiviert wird.
+
+\subsection{Dedizierter Animationsthread}
+Da Animationen kontinuierlich im Hintergrund laufen sollen, ohne den restlichen
+Kernel-Betrieb zu blockieren, wird die Render-Schleife in einem eigenen Thread
+ausgeführt. Der Einstiegspunkt in \texttt{virtio\_gpu\_autostart.cpp} ist
+\texttt{virtio\_gpu\_start\_demo\_animation()}, die nach dem erfolgreichen
+Abschluss der Initialisierung (\texttt{virtio\_gpu\_init\_task()}) aufgerufen
+wird. Die eigentliche Schleife läuft in
+\texttt{virtio\_gpu\_animation\_task()}, die
+\texttt{virtio\_gpu\_demo\_render\_frame()} mit einem inkrementierenden
+Frame-Index aufruft.
+
+\begin{center}
+\begin{tikzpicture}[node distance=1.2cm, >=Stealth,
+    block/.style={rectangle, draw, fill=blue!10, text width=5.5cm, text centered, minimum height=1cm, rounded corners}]
+    \node[block, fill=green!10] (init) {\texttt{virtio\_gpu\_init\_task()}\\(Probe + Handshake + Framebuffer)};
+    \node[block, below=of init] (start) {\texttt{virtio\_gpu\_start\_demo\_animation()}\\(Thread-Start)};
+    \node[block, fill=orange!10, below=of start] (task) {\texttt{virtio\_gpu\_animation\_task()}\\(Render-Loop)};
+    \node[block, fill=blue!5, below=of task] (render) {\texttt{virtio\_gpu\_demo\_render\_frame(frame\_idx++)}};
+    \node[block, fill=green!5, below=of render] (present) {\texttt{present\_demo\_regions(...)}};
+    \draw[->, thick] (init) -- (start);
+    \draw[->, thick] (start) -- (task);
+    \draw[->, thick] (task) -- (render);
+    \draw[->, thick] (render) -- (present);
+    \draw[->, thick] (present.east) -- ++(1,0) -- ++(0,2.5) -- ++(-1,0) -- (task.east);
+\end{tikzpicture}
+\captionof{figure}{Ablauf des dedizierten Animationsthreads}
+\end{center}
+
+\subsection{Laufzeit-Moduswechsel per Tastatur}
+Eine wichtige Erweiterung ist der interaktive Wechsel zwischen dem dynamischen
+Animationsmodus und dem statischen Schachbrettmodus zur Laufzeit. Die Taste
+\texttt{C} (Scan Code Set 1: Make-Code \texttt{0x2e}) wird in
+\texttt{Keyboard::trigger()} erkannt und löst den Aufruf von
+\texttt{virtio\_gpu\_toggle\_checker\_mode()} aus. Der globale Zustand wird
+durch eine atomare Variable gespeichert.
+
+\begin{lstlisting}[language=C++, basicstyle=\small\ttfamily, frame=single, caption=Moduswechsel-Logik in \texttt{virtio\_gpu\_resource.cpp}]
+std::atomic<bool> g_checker_mode{false};
+
+void virtio_gpu_toggle_checker_mode() {
+    bool old = g_checker_mode.load();
+    g_checker_mode.store(!old);
+    if (!old) {
+        // Wechsel zu statischem Modus: Schachbrett zeichnen
+        draw_checkerboard_full();
+    }
+}
+\end{lstlisting}
+
+Die Funktion \texttt{virtio\_gpu\_demo\_render\_frame()} wertet
+\texttt{g\_checker\_mode} zu Beginn jedes Frames aus. Ist der statische Modus
+aktiv, wird der dynamische Render-Pfad übersprungen und der Schachbrettinhalt
+bleibt unverändert auf dem Bildschirm. Dadurch können beide Modi ohne Neustart
+des Kernels direkt verglichen werden.
+
+\subsection{Geänderte Quelldateien im Überblick}
+Tabelle \ref{tab:changed_files} fasst die im Rahmen der dynamischen Erweiterung
+geänderten Dateien zusammen.
+
+\begin{table}[ht]
+\centering
+\caption{Im Rahmen der dynamischen Erweiterung geänderte Quelldateien}
+\label{tab:changed_files}
+\begin{tabular}{l p{8.5cm}}
+\toprule
+\textbf{Datei} & \textbf{Änderungen} \\ \midrule
+\texttt{virtio\_gpu\_resource.cpp} & Dynamischer Renderer (\texttt{virtio\_gpu\_demo\_render\_frame}), Dirty-Rect-Präsentation (\texttt{present\_rect}, \texttt{present\_demo\_regions}), atomarer Modus-Toggle, \texttt{draw\_checkerboard\_full} \\
+\texttt{virtio\_gpu\_autostart.cpp} & Start des Animationsthreads (\texttt{virtio\_gpu\_start\_demo\_animation}, \texttt{virtio\_gpu\_animation\_task}); der Init-Task startet die Animation nach erfolgreicher Probe \\
+\texttt{virtio\_gpu.hpp} & Öffentliche API erweitert um \texttt{virtio\_gpu\_start\_demo\_animation()} und \texttt{virtio\_gpu\_toggle\_checker\_mode()} \\
+\texttt{virtio\_gpu\_internal.hpp} & Interner Vertrag erweitert um \texttt{virtio\_gpu\_demo\_render\_frame(uint32\_t)} \\
+\texttt{Keyboard.cpp} & Erkennung der Taste \texttt{C} (Make-Code \texttt{0x2e}) und Aufruf von \texttt{virtio\_gpu\_toggle\_checker\_mode()} \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\section{Implementierung der HAL-Schnittstellenschicht}
+Die Hardwareabstraktionsschicht (\texttt{os\_hal\_hhu.cpp}) ist der Teil des
+Treibers, der die internen Abläufe von hhuOS konkret anspricht. Sie bildet
+generische Anfragen, etwa das Abbilden von MMIO-Bereichen, auf spezifische
+Kernel-Dienste ab. Dieses Design folgt der Mikrokernel-Philosophie, indem es
+die Hardwarezugriffslogik klar von der zentralen Protokollbehandlung trennt
+\cite{Liedtke1995}.
+
+\section{Fazit der Implementierung}
+Der implementierte Treiber verbindet den hhuOS-Kernel erfolgreich mit der GPU
+des Hosts. Durch die Nutzung paravirtualisierter Virtqueues und expliziter
+DMA-Verwaltung erreicht der Treiber geringe Latenzen bei
+Grafikaktualisierungen bei gleichzeitig geringem Speicherbedarf im
+Gast-Betriebssystem. Die dynamische Erweiterung um Per-Frame-Rendering,
+Dirty-Rect-Präsentation, einen dedizierten Animationsthread und einen
+interaktiven Moduswechsel transformiert den Treiber von einem einfachen
+Initialisierungsnachweis hin zu einem vollständigen Laufzeit-Grafikstack.
+
+\newpage

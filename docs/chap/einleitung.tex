@@ -1,0 +1,66 @@
+\chapter{Einleitung}
+
+\section{Allgemeine Einleitung}
+Die Entwicklung des modernen Rechnens ist im Wesentlichen eine Geschichte des Übergangs von physikalischen Zwängen zu logischen Abstraktionen. In der Pionierzeit der Informatik war Software eine maßgeschneiderte Kreation, die speziell für die einzigartigen elektrischen und mechanischen Eigenschaften einer einzelnen Maschine entwickelt wurde. Die Aufgabe des Programmierers bestand darin, jedes Register, jede Speicheradresse und jede Spannungsänderung manuell zu verwalten. Mit zunehmender Komplexität der Rechenaufgaben wuchs jedoch auch die Notwendigkeit einer vermittelnden Schicht – des Betriebssystems (Operating System, OS). Wie von Silberschatz et al. \cite{Silberschatz2021} beschrieben, entwickelte sich das Betriebssystem zu einem Ressourcenverwalter, der die rohe, flüchtige Natur der Hardware in stabile, wiederverwendbare Dienste abstrahiert.
+
+In der heutigen Landschaft hat diese Abstraktion durch Virtualisierung ihren Höhepunkt erreicht. Hardware wird nicht länger als statische physische Einheit betrachtet, sondern als dynamische, softwaredefinierte Ressource. In diesem Paradigma hat sich die grafische Benutzeroberfläche (Graphical User Interface, GUI) zum primären Medium für die Mensch-Computer-Interaktion (Human-Computer Interaction, HCI) entwickelt. Während frühe Systeme auf einfache textbasierte Fernschreiber angewiesen waren, erwarten moderne Benutzer und Entwickler gleichermaßen hochauflösende, reaktionsschnelle grafische Ausgaben. Infolgedessen hat sich die Grafikprozessoreinheit (Graphics Processing Unit, GPU) von einem peripheren Luxus zu einem erstklassigen Bürger der Computerarchitektur entwickelt. Dieser Übergang zeigt sich besonders deutlich in der Verschiebung hin zu hardwarebeschleunigten Desktop-Compositoren, bei denen selbst die grundlegende Fensterverwaltung eine direkte Interaktion mit der Grafikhardware erfordert – ein Prozess, der in virtualisierten Umgebungen einen erheblichen Mehraufwand verursacht \cite{Belkhiri2024}.
+
+Diese Arbeit konzentriert sich auf die entscheidende Schnittstelle dieser beiden Trends: die Entwicklung eines Grafiktreibers in einer virtualisierten Umgebung für einen experimentellen Betriebssystemkern, insbesondere hhuOS/hhuOS. Wir untersuchen den „VirtIO-GPU“-Standard – eine paravirtualisierte Schnittstelle, die entwickelt wurde, um Gastsystemen hochleistungsfähige Grafik bereitzustellen. Durch die Implementierung dieses Treibers für einen benutzerdefinierten Kernel überbrücken wir die Kluft zwischen abstrakter Kernellogik und sichtbarer grafischer Ausgabe. Diese Arbeit, die auf den etablierten Forschungszielen der HHU-Betriebssystemgruppe aufbaut \cite{Elrich2025}, ist eine Untersuchung darüber, wie moderne Paravirtualisierungsstandards genutzt werden können, um die Hardwareinteraktion zu vereinfachen und gleichzeitig eine Leistung zu erhalten, die sich nativen Geschwindigkeiten annähert.
+
+\section{Hintergrund zu Betriebssystemen und Virtualisierung}
+Um die Rolle eines VirtIO-GPU-Treibers zu verstehen, muss man die technischen Hürden kennen, die die Virtualisierung zu überwinden versucht. Das Konzept der Virtualisierung geht auf die 1960er Jahre mit IBM-Großrechnern zurück, aber seine Anwendung auf die x86-Architektur war über Jahrzehnte hinweg bekanntermaßen schwierig. Der x86-Befehlssatz war ursprünglich nicht gemäß den klassischen Popek- und Goldberg-Anforderungen virtualisierbar konzipiert. Diese Anforderungen besagen, dass alle „sensiblen“ Befehle einen Trap zum Hypervisor auslösen müssen, wenn sie von einem Gast ausgeführt werden.
+
+Auf Standard-x86-Hardware läuft das Betriebssystem typischerweise im „Ring 0“, während Anwendungen im „Ring 3“ ausgeführt werden. In einer virtualisierten Umgebung „glaubt“ das Gast-Betriebssystem, es sei in Ring 0, wird aber tatsächlich von einem Hypervisor verwaltet. Frühe Lösungen nutzten „Binary Translation“, um Gastcode spontan umzuschreiben. Darauf folgte die Einführung der hardwaregestützten Virtualisierung (Intel VT-x und AMD-V), die die notwendigen Hardware-Primitiven bereitstellte, um Gast- und Host-Modi effektiv zu unterstützen.
+
+Trotz der Hardwareunterstützung bleibt die „Vollständige Emulation“ langsam. In diesem Modell simuliert eine VMM wie QEMU eine gesamte physische Maschine in Software. Für ein Gast-Betriebssystem erscheint die emulierte Hardware als ein Standard-Legacy-Gerät, wie z.B. eine Cirrus Logic VGA-Karte. Wie Belkhiri und Dagenais in ihrer Leistungsstudie \cite{Belkhiri2024} anmerken, muss die CPU jedes Mal, wenn das Gast-Betriebssystem ein Pixel ändert, einen „VM-Exit“ auslösen und den Kontext zum Host wechseln. Dieser „Trap-and-Emulate“-Zyklus erzeugt einen massiven Engpass für Grafiken. Die „Semantische Lücke“ – das mangelnde Verständnis des Hosts darüber, was der Gast zu erreichen versucht – verschärft dies zusätzlich, da der Host nur rohe Speicherschreibvorgänge sieht und keine hochwertigen Zeichenbefehle.
+
+\section{Virtio-Standard und seine Bedeutung}
+Der VirtIO-Standard, der 2022 auf Version 1.2 aktualisiert wurde \cite{Virtio12}, stellt den Versuch der Industrie dar, paravirtualisierte Schnittstellen zu vereinheitlichen. VirtIO bietet eine standardisierte Transportschicht über den PCI-Bus und ermöglicht es einem einzigen Treiber, mit jedem Hypervisor zu arbeiten, der die Spezifikation unterstützt. Diese Standardisierung ist entscheidend für das „Cloud-Zeitalter“, in dem virtuelle Maschinen zwischen verschiedenen Host-Architekturen migrierbar sein müssen, ohne die Gerätefunktionalität zu verlieren.
+
+Das Herzstück der VirtIO-Architektur ist der „Virtqueue“. Ein Virtqueue ermöglicht Zero-Copy- oder Datentransfer mit geringem Overhead unter Verwendung von drei Teilen:
+\begin{enumerate}
+    \item \textbf{Deskriptortabelle:} Eine Liste von Speicherpuffern, die vom Gast-Betriebssystem bereitgestellt werden.
+    \item \textbf{Available Ring:} Hier platziert der Gasttreiber Indizes von Deskriptoren, die vom Host verarbeitet werden sollen.
+    \item \textbf{Used Ring:} Hier benachrichtigt der Host (Hypervisor) den Gast, dass die Verarbeitung abgeschlossen ist.
+\end{enumerate}
+
+Die Bedeutung der VirtIO-GPU-Spezifikation liegt insbesondere in ihrer Abkehr vom synchronen „Register-Memory“-Modell. Herkömmliche VGA-Geräte verlassen sich darauf, dass die CPU manuell Pixeldaten in MMIO-Bereiche schreibt, was die CPU anhält, bis die Bus-Transaktion abgeschlossen ist. VirtIO-GPU verwendet ein befehlsbasiertes Protokoll, das hochrangige Befehle in einen Virtqueue sendet. Dies ermöglicht einen asynchronen Betrieb, der für die Systemreaktionsfähigkeit und eine vorhersagbare Kommunikation zwischen VMs entscheidend ist \cite{Zhao2022}. Moderne Versionen der Spezifikation führen auch „Packed Virtqueues“ ein, die die Effizienz von hochauflösenden Frame-Übertragungen verbessern.
+
+\section{Problemstellung}
+Trotz der Eleganz des VirtIO-Standards bringt seine Implementierung in einem experimentellen Kernel wie hhuOS/hhuOS mehrere erhebliche Herausforderungen mit sich:
+
+\textbf{1. Die Speicherabbildungslücke:} Es gibt drei Ebenen von Speicheradressen: Gast-Virtual (GVA), Gast-Physisch (GPA) und Host-Physisch (HPA). Das VirtIO-GPU-Gerät benötigt GPA für seine Virtqueues. Die Koordinierung der internen Seitentabellen des Kernels mit den Anforderungen des PCI-Busses ist eine ständige Quelle von „Seitenfehlern“ (Page Faults).
+
+\textbf{2. Debugging-Probleme in der frühren Initialisierungsphase:} Die Entwicklung eines
+Grafiktreibers ist besonders in den frühen Phasen der Initialisierung anspruchsvoll,
+da Fehler häufig bereits vor der ersten erfolgreichen Bildausgabe auftreten. Wenn der
+Treiber beispielsweise während der Feature-Verhandlung oder beim Aufbau der
+Virtqueues scheitert, bleibt die grafische Ausgabe aus. Die Analyse solcher Fehler
+erfolgt daher typischerweise über serielle Protokollierung und weitere nicht-grafische
+Debugging-Verfahren.
+
+\textbf{3. Asynchrone Synchronisation:} Wenn der Gast einen Puffer ändert, während der Host ihn für eine Bildschirmaktualisierung liest, kommt es zu visuellen Störungen (Corruption). Die Implementierung eines präzisen Benachrichtigungssystems innerhalb einer Mikrokernel-Architektur erfordert ein tiefes Verständnis der Scheduler-Latenz, ein Thema von zunehmender Bedeutung in modernen sicheren eingebetteten Systemen \cite{DeMatos2025}.
+
+\textbf{4. Protokollstrenge:} Die VirtIO 1.1/1.2-Spezifikationen sind sehr spezifisch in Bezug auf die Statusbits (ACKNOWLEDGE, DRIVER, FEATURES\_OK). Jede Abweichung führt dazu, dass der Hypervisor das Gerät einfriert.
+
+\section{Forschungsfragen}
+\begin{itemize}[leftmargin=1.5cm]
+    \item \textbf{RQ1:} Wie kann ein Treiber eine strikte Trennung zwischen generischer VirtIO-Logik und der OS-spezifischen Hardwareabstraktionsschicht (Hardware Abstraction Layer, HAL) aufrechterhalten?
+    \item \textbf{RQ2:} Welche Leistungsauswirkungen haben paravirtualisierte Befehlswarteschlangen im Vergleich zu Legacy-VGA in einem Forschungskernel?
+    \item \textbf{RQ3:} Wie kann der Kernel DMA-gestützte Ressourcen für die GPU unter strikter Speicherisolierung sicher verwalten?
+    \item \textbf{RQ4:} Was ist die minimal realisierbare Implementierung von VirtIO-GPU, die für eine treibergesteuerte Ausgabe erforderlich ist?
+\end{itemize}
+
+\section{Forschungsziele}
+Das primäre Ziel ist der Entwurf und die Implementierung eines funktionalen 2D-VirtIO-GPU-Treibers.
+\begin{enumerate}
+    \item \textbf{PCI-Infrastruktur:} Aufbau eines Mechanismus zum Durchsuchen des PCI-Busses und zur Abbildung der fünf spezifischen VirtIO-PCI-Fähigkeiten (Capabilities).
+    \item \textbf{Warteschlangenverwaltung:} Aufbau eines robusten Virtqueue-Systems, das die Verkettung von Deskriptoren (Descriptor Chaining) handhabt.
+    \item \textbf{Grafikprotokoll:} Implementierung kritischer 2D-Befehle: \texttt{RESOURCE\_CREATE\_2D}, \texttt{RESOURCE\_ATTACH\_BACKING}, \texttt{SET\_SCANOUT} und \texttt{RESOURCE\_FLUSH}.
+    \item \textbf{Verifikation:} Erstellung eines Testmustergenerators innerhalb des Kernels zur visuellen Überprüfung.
+\end{enumerate}
+
+\section{Bedeutung der Forschung}
+Akademisch gesehen liefert diese Arbeit eine dokumentierte Implementierung eines komplexen paravirtualisierten Geräts. Technisch gesehen verwandelt dieser Treiber das Ziel-Betriebssystem von einem rein textbasierten Projekt in eine visuell leistungsfähige Plattform. Durch die Verwendung von VirtIO stellen wir die Kompatibilität mit modernen Cloud-Infrastrukturen und Hochdurchsatz-Kommunikationsframeworks sicher \cite{Zhao2022} und bieten eine Vorlage für zukünftige VirtIO-basierte Treiber in sicheren Umgebungen \cite{DeMatos2025}.
+
+\newpage
